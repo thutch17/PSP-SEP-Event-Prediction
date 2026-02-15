@@ -1,8 +1,14 @@
 import pandas as pd
 from tqdm import tqdm
+import numpy as np
 
 AU_TO_KM = 1.496e8
-SPEED = 3 * 400.0
+SPEED = 10 * 400.0
+
+# Parker spiral constants
+PARKER_A = 4.9e-17
+PARKER_B = 7e-9
+PARKER_C = 7.14e7
 
 final_df = pd.read_csv("final_psp_df_3hr_cadence.csv", parse_dates=["SDO_time"])
 epihi_df = pd.read_csv("psp_epihi_jlinlin.csv", parse_dates=["time"])
@@ -12,11 +18,18 @@ epilo_df = pd.read_csv("psp_epilo_jlinlin.csv", parse_dates=["time"])
 epihi_df = epihi_df.sort_values("time")
 epilo_df = epilo_df.sort_values("time")
 
-# add t_offset column
-if "t_offset_s" not in final_df.columns:
-    final_df["t_offset_s"] = (final_df["psp_ephem_features_HCI_R"] * AU_TO_KM) / SPEED
+# computer parker spiral distance
+r_km = final_df["psp_ephem_features_HCI_R"] * AU_TO_KM
 
-offset = pd.to_timedelta(final_df["t_offset_s"], unit="s")
+final_df["parker_spiral_distance"] = (
+    0.5 * np.sqrt(PARKER_A * r_km**2 + 1) * r_km
+    + PARKER_C * np.arcsinh(PARKER_B * r_km)
+)
+
+# use distance traveled by particle along parker spiral for time offset
+final_df["t_offset_s_10x"] = final_df["parker_spiral_distance"] / SPEED
+
+offset = pd.to_timedelta(final_df["t_offset_s_10x"], unit="s")
 
 # helper to compute mean flux over the given window
 def compute_mean_flux(df, start, end):
@@ -36,8 +49,8 @@ for SDO_time, dt in tqdm(zip(final_df["SDO_time"], offset), total=len(final_df),
     epihi_vals.append(compute_mean_flux(epihi_df, t_start, t_end))
     epilo_vals.append(compute_mean_flux(epilo_df, t_start, t_end))
 
-final_df["epihi_jlinlin_offset"] = epihi_vals
-final_df["epilo_jlinlin_offset"] = epilo_vals
+final_df["epihi_jlinlin_offset_10x"] = epihi_vals
+final_df["epilo_jlinlin_offset_10x"] = epilo_vals
 
 final_df.to_csv("final_psp_df_3hr_cadence_with_offsets.csv", index=False)
 

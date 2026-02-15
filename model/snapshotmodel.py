@@ -25,6 +25,7 @@ import wandb
 
 import argparse
 
+print("SNAPSHOT MODEL")
 parser = argparse.ArgumentParser(
     description="Train SEP prediction model using PSP and SDO/AIA data."
 )
@@ -45,6 +46,8 @@ parser.add_argument("--train_block_size", type=int, default=80,
                     help="Training block size")
 parser.add_argument("--train_fraction", type=float, default=1,
                     help="Fraction of each training block to use (0 < p <= 1)")
+parser.add_argument("--seed", type=int, default=1717,
+                    help="random seed for train/test split")
 
 args = parser.parse_args()
 
@@ -56,6 +59,7 @@ num_conv = args.num_conv
 dropout_rate = args.dropout
 train_block_size = args.train_block_size
 train_fraction = args.train_fraction
+seed = args.seed
 
 print(f"""
 === training configuration ===
@@ -71,24 +75,43 @@ train_fraction:    {train_fraction}
 """)
 
 def compute_metrics(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    TP = cm[1,1]
-    TN = cm[0,0]
-    FP = cm[0,1]
-    FN = cm[1,0]
-    
-    accuracy = (TP + TN) / cm.sum()
-    false_alarm_rate = FP / (FP + TN) if (FP + TN) > 0 else 0
-
-    tpr = TP / (TP + FN) if (TP + FN) > 0 else 0
-    tnr = TN / (TN + FP) if (TN + FP) > 0 else 0
-    tss = tpr + tnr - 1
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+    TN, FP, FN, TP = cm.ravel()
 
     total = TP + TN + FP + FN
-    expected_accuracy = ((TP + FP)*(TP + FN) + (FN + TN)*(FP + TN)) / total**2
-    hss = (accuracy - expected_accuracy) / (1 - expected_accuracy) if (1 - expected_accuracy) > 0 else 0
 
-    return cm, accuracy, false_alarm_rate, tss, hss
+    acc = (TP + TN) / max(total, 1)
+
+    precision = TP / max((TP + FP), 1)
+    recall    = TP / max((TP + FN), 1) # probability of detection (POD)
+
+
+    FAR = FP / max((TP + FP), 1) # false alarm ratio
+    FPR = FP / max((FP + TN), 1) # false positive rate (for TSS)
+
+    # skill scores
+    TSS = recall - FPR
+
+    denom = (TP + FN)*(FN + TN) + (TP + FP)*(FP + TN)
+    HSS = (2*(TP*TN - FP*FN))/denom if denom != 0 else 0
+
+    # F1 score
+    F1 = (2 * precision * recall / max((precision + recall), 1e-12))
+
+    return {
+        "cm": cm,
+        "acc": acc,
+        "precision": precision,
+        "recall/POD": recall,
+        "FAR": FAR,
+        "TSS": TSS,
+        "HSS": HSS,
+        "F1": F1,
+        "TP": TP,
+        "FP": FP,
+        "TN": TN,
+        "FN": FN,
+    }
 
 def plot_confusion_matrix(cm, title="Confusion Matrix"):
     fig, ax = plt.subplots(figsize=(5,4))
@@ -98,7 +121,11 @@ def plot_confusion_matrix(cm, title="Confusion Matrix"):
     ax.set_title(title)
     return fig
 
-name = f"ep{epochs}_bs{batch_size}_lr{learning_rate}_dense{num_dense}_conv{num_conv}_drop{dropout_rate}_trainbatch{train_block_size}_epilo"
+def count_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+name = f"SS10Pep{epochs}_bs{batch_size}_lr{learning_rate}_dense{num_dense}_conv{num_conv}_drop{dropout_rate}_trainbatch{train_block_size}_seed{seed}"
+print("training:", name)
 
 os.environ["WANDB_MODE"] = "offline"
 
@@ -122,9 +149,9 @@ wandb.init(
 )
 
 # data loading and preprocessing
-H5_PATH = "/scratch/gpfs/th5879/data_collection/aia171_images_3hr_cadence.h5"
-CSV_PATH = "/scratch/gpfs/th5879/data_collection/final_psp_df_3hr_cadence.csv"
-MODEL_OUT = f"/scratch/gpfs/th5879/model/models/sep_prediction_{name}.pt"
+H5_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5"
+CSV_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/final_psp_df_3hr_cadence.csv"
+MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_prediction_{name}.pt"
 
 print("loading PSP dataframe...")
 df = pd.read_csv(CSV_PATH)
@@ -136,7 +163,7 @@ df = df[df["photo_captures_footprint"] != 0].reset_index(drop=True)
 print(f"Length after filtering captured_footprint==0: {len(df)}")
 
 print(f"Length before filtering NaNs in targets: {len(df)}")
-df = df.dropna(subset=["epilo_jlinlin_offset"]).reset_index(drop=True)
+df = df.dropna(subset=["epilo_jlinlin_offset_10x"]).reset_index(drop=True)
 print(f"Length after filtering NaNs in targets: {len(df)}")
 
 print("loading images from HDF5 file")
@@ -153,7 +180,7 @@ times = times[mask]
 print("matching PSP times to image times...")
 df = df.sort_values("SDO_time").reset_index(drop=True)
 matched_idx = []
-for t in tqdm(df["SDO_time"], desc="Matching times"):
+for t in df["SDO_time"]:
     deltas = np.abs((times - t).total_seconds())
     idx = np.argmin(deltas)
     matched_idx.append(valid_indices[idx])
@@ -166,7 +193,8 @@ print("loading matched HDF5 images (subset only)...")
 with h5py.File(H5_PATH, "r") as f:
     images_dset = f["images"]
     X = np.empty((len(df), 512, 512), dtype=np.float32)
-    for i, idx in enumerate(tqdm(df["img_index"], desc="Reading HDF5 images")):
+    print("reading h5 images...")
+    for i, idx in enumerate(df["img_index"]):
         X[i] = images_dset[idx][...]
 
 # clean images of nans/negative pixels
@@ -191,7 +219,7 @@ r_feature = df["psp_ephem_features_HCI_R"].values.astype(np.float32)
 aux_features = np.concatenate([pos, r_feature.reshape(-1, 1)], axis=1)
 
 # log normalize the prediction targets
-y_full = df[["epilo_jlinlin_offset"]].values.astype(np.float32)  # only epilo
+y_full = df[["epilo_jlinlin_offset_10x"]].values.astype(np.float32)  # only epilo
 y_log = np.log1p(y_full)
 y_mean = np.mean(y_log, axis=0)
 y_std = np.std(y_log, axis=0)
@@ -206,7 +234,7 @@ aux_orig = aux_features.copy()
 num_blocks = len(df) // train_block_size
 
 # randomly shuffle blocks
-rng = np.random.default_rng(seed=1717)
+rng = np.random.default_rng(seed=seed)
 block_ids = np.arange(num_blocks)
 rng.shuffle(block_ids)
 
@@ -300,9 +328,12 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 )
 
 print(model)
+num_params = count_trainable_params(model)
+print(f"Number of trainable parameters: {num_params:,}")
 
 # training loop
 best_val_loss = float("inf")
+best_epoch = 0
 for epoch in range(epochs):
     model.train()
     train_losses = []
@@ -339,6 +370,10 @@ for epoch in range(epochs):
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         torch.save(model.state_dict(), MODEL_OUT)
+        best_epoch = epoch
+    elif epoch - best_epoch > 50:
+        print(f"EARLY STOPPING")
+        break
 
 print(f"Best validation loss: {best_val_loss:.3e}")
 print(f"saved model to {MODEL_OUT}")
@@ -395,7 +430,9 @@ for i, name in enumerate(["epilo"]):
     ax_train.set_title(f"Train: Predicted vs Actual {name} (colored by date)")
     ax_train.grid(True, which="both", ls="--")
     cbar = fig_train.colorbar(sc, ax=ax_train)
-    cbar.set_label('date (matplotlib date number)')
+    cbar.set_label("Date")
+    cbar.ax.yaxis.set_major_locator(mdates.AutoDateLocator())
+    cbar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     wandb.log({f"train_pred_vs_actual_{name}": wandb.Image(fig_train)})
     plt.close(fig_train)
 
@@ -414,10 +451,12 @@ for i, name in enumerate(["epilo"]):
     ax_val.set_yscale('log')
     ax_val.set_xlabel(f"Actual {name}")
     ax_val.set_ylabel(f"Predicted {name}")
-    ax_val.set_title(f"Val: Predicted vs Actual {name} (colored by date)")
+    ax_val.set_title(f"Snapshot: Actual vs. Predicted Jlinlin")
     ax_val.grid(True, which="both", ls="--")
     cbar = fig_val.colorbar(sc, ax=ax_val)
-    cbar.set_label('date (matplotlib date number)')
+    cbar.set_label("Date")
+    cbar.ax.yaxis.set_major_locator(mdates.AutoDateLocator())
+    cbar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     wandb.log({f"val_pred_vs_actual_{name}": wandb.Image(fig_val)})
     plt.close(fig_val)
 
@@ -469,8 +508,8 @@ for j, date_str in enumerate(test_dates):
         ax_img.axis("off")
 
     ax_plot = fig.add_subplot(gs[1, :])
-    ax_plot.plot(times_sub, y_true_phys[:, 0], "o-", label="Actual epilo", color="C0")
-    ax_plot.plot(times_sub, y_pred_phys[:, 0], "s--", label="Predicted epilo", color="C1")
+    ax_plot.plot(times_sub, y_true_phys[:, 0], "o-", label="Actual Jlinlin", color="C0")
+    ax_plot.plot(times_sub, y_pred_phys[:, 0], "s--", label="Predicted Jlinlin", color="C1")
     ax_plot.set_yscale("log")
     ax_plot.set_xlabel("Time (UT)")
     ax_plot.set_ylabel("epilo flux")
@@ -493,28 +532,74 @@ y_train_true_bin = (y_train_true_phys[:, 0] > threshold).astype(int)
 y_val_pred_bin = (y_val_pred_phys[:, 0] > threshold).astype(int)
 y_val_true_bin = (y_val_true_phys[:, 0] > threshold).astype(int)
 
-cm_train, acc_train, far_train, tss_train, hss_train = compute_metrics(y_train_true_bin, y_train_pred_bin)
-fig_cm_train = plot_confusion_matrix(cm_train, title="Train Confusion Matrix")
-wandb.log({
-    "train_confusion_matrix": wandb.Image(fig_cm_train),
-    "train_accuracy": acc_train,
-    "train_false_alarm_rate": far_train,
-    "train_tss": tss_train,
-    "train_hss": hss_train
-})
-plt.close(fig_cm_train)
+train_metrics = compute_metrics(y_train_true_bin, y_train_pred_bin)
+val_metrics   = compute_metrics(y_val_true_bin, y_val_pred_bin)
+print("\nClassification statistics:\n")
+print("---- Train ----")
+print(f"Accuracy:           {train_metrics['acc']:.4f}")
+print(f"Precision:          {train_metrics['precision']:.4f}")
+print(f"Recall (POD):       {train_metrics['recall/POD']:.4f}")
+print(f"False Alarm Ratio:  {train_metrics['FAR']:.4f}")
+print(f"TSS:                {train_metrics['TSS']:.4f}")
+print(f"HSS:                {train_metrics['HSS']:.4f}")
+print(f"F1:                 {train_metrics['F1']:.4f}")
+print(f"Confusion Matrix:\n{train_metrics['cm']}\n")
 
-# log confusion matrix & classification statistics
-cm_val, acc_val, far_val, tss_val, hss_val = compute_metrics(y_val_true_bin, y_val_pred_bin)
-fig_cm_val = plot_confusion_matrix(cm_val, title="Validation Confusion Matrix")
+print("---- Validation ----")
+print(f"Accuracy:           {val_metrics['acc']:.4f}")
+print(f"Precision:          {val_metrics['precision']:.4f}")
+print(f"Recall (POD):       {val_metrics['recall/POD']:.4f}")
+print(f"False Alarm Ratio:  {val_metrics['FAR']:.4f}")
+print(f"TSS:                {val_metrics['TSS']:.4f}")
+print(f"HSS:                {val_metrics['HSS']:.4f}")
+print(f"F1:                 {val_metrics['F1']:.4f}")
+print(f"Confusion Matrix:\n{val_metrics['cm']}\n")
+fig_train_cm = plot_confusion_matrix(train_metrics["cm"], "Train Confusion Matrix")
+fig_val_cm   = plot_confusion_matrix(val_metrics["cm"], "Validation Confusion Matrix")
+plt.show()
 wandb.log({
-    "val_confusion_matrix": wandb.Image(fig_cm_val),
-    "val_accuracy": acc_val,
-    "val_false_alarm_rate": far_val,
-    "val_tss": tss_val,
-    "val_hss": hss_val
+    "train_accuracy": train_metrics["acc"],
+    "train_precision": train_metrics["precision"],
+    "train_recall": train_metrics["recall/POD"],
+    "train_false_alarm_ratio": train_metrics["FAR"],
+    "train_tss": train_metrics["TSS"],
+    "train_hss": train_metrics["HSS"],
+    "train_f1": train_metrics["F1"],
+
+    "val_accuracy": val_metrics["acc"],
+    "val_precision": val_metrics["precision"],
+    "val_recall": val_metrics["recall/POD"],
+    "val_false_alarm_ratio": val_metrics["FAR"],
+    "val_tss": val_metrics["TSS"],
+    "val_hss": val_metrics["HSS"],
+    "val_f1": val_metrics["F1"],
 })
-plt.close(fig_cm_val)
+
+wandb.log({
+    "train_confusion_matrix": wandb.Image(fig_train_cm),
+    "val_confusion_matrix": wandb.Image(fig_val_cm),
+})
+
+PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/SS10P_val_preds_seed{seed}.npz"
+os.makedirs(os.path.dirname(PRED_OUT), exist_ok=True)
+
+np.savez(
+    PRED_OUT,
+    train_true_phys = y_train_true_phys,
+    train_pred_phys = y_train_pred_phys,
+    train_dates_mpl = train_dates_mpl,
+
+    val_true_phys   = y_val_true_phys,
+    val_pred_phys   = y_val_pred_phys,
+    val_dates_mpl   = val_dates_mpl,
+
+    seed = seed,
+)
+
+print(f"saved validation predictions to {PRED_OUT}")
+
+plt.close(fig_train_cm)
+plt.close(fig_val_cm)
 
 wandb.finish()
 

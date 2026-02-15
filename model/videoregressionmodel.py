@@ -58,7 +58,7 @@ class WindowedDataset(Dataset):
 # model
 class ResNetBackbone(nn.Module):
     def __init__(self, in_channels=1, emb_dim=256,
-                 pretrained_path="/scratch/gpfs/th5879/model/resnet18_imagenet.pth"):
+                 pretrained_path="/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/resnet18_imagenet.pth"):
         super().__init__()
 
         self.resnet = models.resnet18(weights=None)
@@ -199,9 +199,9 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
         max_val: scalar maximum value used for normalization
     """
     if cache_file is None:
-        cache_file = "/scratch/gpfs/th5879/data_collection/matched_images_171.pkl"
+        cache_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_171.pkl"
     if max_file is None:
-        max_file = "/scratch/gpfs/th5879/data_collection/matched_images_max_171.pkl"
+        max_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_171.pkl"
 
     # load cached results if available
     if os.path.exists(cache_file) and os.path.exists(max_file):
@@ -213,14 +213,15 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
         return images_all, max_val
 
     # open HDF5 file
-    with h5py.File("/scratch/gpfs/th5879/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
+    with h5py.File("/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
         times_171 = pd.to_datetime(np.array(f171["T_OBS"], dtype=str), errors='coerce')
         print(f"[DEBUG] 171 timestamps: {times_171.min()} → {times_171.max()}")
 
         images_list = []
         max_171 = 0.0
 
-        for t in tqdm(df["SDO_time"], desc="Preloading 171 images"):
+        print("preloading 171 images...")
+        for t in df["SDO_time"]:
             # nearest 171 timestamp
             idx171 = np.argmin(np.abs((times_171 - t).total_seconds()))
             img171 = np.nan_to_num(f171["images"][idx171][...], nan=0.0)
@@ -250,26 +251,42 @@ def invert_log_scaling(y_scaled, y_mean, y_std):
     return np.expm1(y_scaled)
 
 def compute_metrics(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
     TN, FP, FN, TP = cm.ravel()
 
-    # accuracy, precision, recall
-    acc = (TP + TN) / max((TP + TN + FP + FN), 1)
+    total = TP + TN + FP + FN
+
+    acc = (TP + TN) / max(total, 1)
 
     precision = TP / max((TP + FP), 1)
-    recall    = TP / max((TP + FN), 1)
+    recall    = TP / max((TP + FN), 1) # probability of detection (POD)
 
-    # false alarm rate
-    far = FP / max((FP + TN), 1)
+    FAR = FP / max((TP + FP), 1) # false alarm ratio
+    FPR = FP / max((FP + TN), 1) # false positive rate (for TSS)
 
-    # true skill score
-    tss = recall - far
+    # skill scores
+    TSS = recall - FPR
 
-    # Heidke Skill Score
-    denom = (TP + FN) * (FN + TN) + (TP + FP) * (FP + TN)
-    hss = (2 * (TP * TN - FP * FN)) / denom if denom != 0 else 0
+    denom = (TP + FN)*(FN + TN) + (TP + FP)*(FP + TN)
+    HSS = (2*(TP*TN - FP*FN))/denom if denom != 0 else 0
 
-    return cm, acc, precision, recall, far, tss, hss
+    # F1 score
+    F1 = (2 * precision * recall / max((precision + recall), 1e-12))
+
+    return {
+        "cm": cm,
+        "acc": acc,
+        "precision": precision,
+        "recall/POD": recall,
+        "FAR": FAR,
+        "TSS": TSS,
+        "HSS": HSS,
+        "F1": F1,
+        "TP": TP,
+        "FP": FP,
+        "TN": TN,
+        "FN": FN,
+    }
 
 def plot_confusion_matrix(cm, title="Confusion Matrix"):
     fig, ax = plt.subplots(figsize=(5,4))
@@ -299,11 +316,14 @@ def plot_pred_vs_actual(y_true, y_pred, dates_mpl, name="epilo", title_prefix="T
     ax.set_title(f"{title_prefix}: Predicted vs Actual {name} (colored by date)")
     ax.grid(True, which="both", ls="--")
     cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label("date (matplotlib date number)")
+    cbar.set_label("Date")
+    cbar.ax.yaxis.set_major_locator(mdates.AutoDateLocator())
+    cbar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     return fig
 
 def main():
-    CSV_PATH = "/scratch/gpfs/th5879/data_collection/final_psp_df_3hr_cadence.csv"
+    print("VIDEO REGRESSION")
+    CSV_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/final_psp_df_3hr_cadence.csv"
     df = pd.read_csv(CSV_PATH)
     df['SDO_time'] = pd.to_datetime(df['SDO_time'])
 
@@ -322,6 +342,8 @@ def main():
     parser.add_argument("--train_block_size", type=int, default=80, help="Training block size")
     parser.add_argument("--train_fraction", type=float, default=1, help="Fraction of each training block to use (0 < p <= 1)")
     parser.add_argument("--window_size", type=int, default=8, help="Window size")
+    parser.add_argument("--seed", type=int, default=1717, help="Window size")
+
 
     args = parser.parse_args()
 
@@ -332,6 +354,7 @@ def main():
     train_block_size = args.train_block_size
     train_fraction = args.train_fraction
     window_size = args.window_size
+    random_seed = args.seed
 
     print(f"""
     === training configuration ===
@@ -346,10 +369,11 @@ def main():
     """)
 
     name = (
-        f"TRANSep{epochs}_bs{batch_size}_lr{learning_rate}"
-        f"_drop{dropout_rate}_trainbatch{train_block_size}"
+        f"TREG10Pep{epochs}_bs{batch_size}_lr{learning_rate}"
+        f"_drop{dropout_rate}_trainbatch{train_block_size}_seed{random_seed}"
     )
-    MODEL_OUT = f"/scratch/gpfs/th5879/model/models/sep_prediction_{name}.pt"
+    print("training:", name)
+    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_prediction_{name}.pt"
     os.environ["WANDB_MODE"] = "offline"
 
     # set device to use gpu
@@ -368,7 +392,7 @@ def main():
         }
     )
 
-    y_full = df[["epilo_jlinlin_offset"]].values.astype(np.float32)
+    y_full = df[["epilo_jlinlin_offset_10x"]].values.astype(np.float32)
     y_log = np.log1p(y_full)
     y_mean = np.mean(y_log, axis=0)
     y_std = np.std(y_log, axis=0)
@@ -388,7 +412,7 @@ def main():
     blocks = [all_indices[i:i+train_block_size] for i in range(0, len(all_indices), train_block_size)]
 
     # shuffle blocks
-    rng = np.random.default_rng(seed=1717)
+    rng = np.random.default_rng(seed=random_seed)
     rng.shuffle(blocks)
 
     # split 80/20 into train/val
@@ -449,7 +473,7 @@ def main():
     # training loop with early stopping
     best_val_loss = float("inf")
     best_epoch = 0
-    MODEL_OUT = f"/scratch/gpfs/th5879/model/models/sep_time{name}.pt"
+    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_time{name}.pt"
     print("starting training")
 
     for epoch in range(epochs):
@@ -504,8 +528,8 @@ def main():
             best_val_loss = val_loss
             best_epoch = epoch
             torch.save(model.state_dict(), MODEL_OUT)
-        elif epoch - best_epoch > 30:
-            print(f"No improvement after 30 epochs, stopping early.")
+        elif epoch - best_epoch > 50:
+            print(f"No improvement after 50 epochs, stopping early.")
             break
 
     # load best model
@@ -516,7 +540,8 @@ def main():
     # evaluate final predictions based on best model (no qualitative plots)
     with torch.no_grad():
         y_train_pred, y_train_true_phys = [], []
-        for Xb, auxb, yb in tqdm(train_loader, desc="Evaluating train set"):
+        print("evaluating train set...")
+        for Xb, auxb, yb in train_loader:
             # create time embeddings for SEPSeqModel
             B, T, C, H, W = Xb.shape
 
@@ -528,7 +553,8 @@ def main():
         y_train_true_phys = invert_log_scaling(np.vstack(y_train_true_phys), y_mean, y_std)
 
         y_val_pred, y_val_true_phys = [], []
-        for Xb, auxb, yb in tqdm(val_loader, desc="Evaluating val set"):
+        print('evaluating val set...')
+        for Xb, auxb, yb in val_loader:
             B, T, C, H, W = Xb.shape
 
             preds = model(Xb.to(device), auxb.to(device))
@@ -549,40 +575,79 @@ def main():
     y_val_pred_bin = (y_val_pred_phys[:, 0] > threshold).astype(int)
     y_val_true_bin = (y_val_true_phys[:, 0] > threshold).astype(int)
 
-    # compute classification metrics
-    cm_train, acc_train, prec_train, rec_train, far_train, tss_train, hss_train = \
-        compute_metrics(y_train_true_bin, y_train_pred_bin)
+    # compute metrics
+    train_metrics = compute_metrics(y_train_true_bin, y_train_pred_bin)
+    val_metrics   = compute_metrics(y_val_true_bin, y_val_pred_bin)
 
+    # print metrics
+    print("\nClassification statistics:\n")
+    print("---- Train ----")
+    print(f"Accuracy:           {train_metrics['acc']:.4f}")
+    print(f"Precision:          {train_metrics['precision']:.4f}")
+    print(f"Recall (POD):       {train_metrics['recall/POD']:.4f}")
+    print(f"False Alarm Ratio:  {train_metrics['FAR']:.4f}")
+    print(f"TSS:                {train_metrics['TSS']:.4f}")
+    print(f"HSS:                {train_metrics['HSS']:.4f}")
+    print(f"F1:                 {train_metrics['F1']:.4f}")
+    print(f"Confusion Matrix:\n{train_metrics['cm']}\n")
 
-    cm_val, acc_val, prec_val, rec_val, far_val, tss_val, hss_val = \
-        compute_metrics(y_val_true_bin, y_val_pred_bin)
+    print("---- Validation ----")
+    print(f"Accuracy:           {val_metrics['acc']:.4f}")
+    print(f"Precision:          {val_metrics['precision']:.4f}")
+    print(f"Recall (POD):       {val_metrics['recall/POD']:.4f}")
+    print(f"False Alarm Ratio:  {val_metrics['FAR']:.4f}")
+    print(f"TSS:                {val_metrics['TSS']:.4f}")
+    print(f"HSS:                {val_metrics['HSS']:.4f}")
+    print(f"F1:                 {val_metrics['F1']:.4f}")
+    print(f"Confusion Matrix:\n{val_metrics['cm']}\n")
 
-    fig_train_cm = plot_confusion_matrix(cm_train, title="Train Confusion Matrix")
-    fig_val_cm   = plot_confusion_matrix(cm_val, title="Validation Confusion Matrix")
+    # plot confusion matrices
+    fig_train_cm = plot_confusion_matrix(train_metrics["cm"], "Train Confusion Matrix")
+    fig_val_cm   = plot_confusion_matrix(val_metrics["cm"], "Validation Confusion Matrix")
+    plt.show()
 
     wandb.log({
         "train_confusion_matrix": wandb.Image(fig_train_cm),
-        "val_confusion_matrix": wandb.Image(fig_val_cm)
+        "val_confusion_matrix": wandb.Image(fig_val_cm),
     })
-
-    # log metrics to wandb
     wandb.log({
-        "train_accuracy": acc_train,
-        "train_precision": prec_train,
-        "train_recall": rec_train,
-        "train_false_alarm_rate": far_train,
-        "train_tss": tss_train,
-        "train_hss": hss_train,
-        "val_accuracy": acc_val,
-        "val_precision": prec_val,
-        "val_recall": rec_val,
-        "val_false_alarm_rate": far_val,
-        "val_tss": tss_val,
-        "val_hss": hss_val
+        "train_accuracy": train_metrics["acc"],
+        "train_precision": train_metrics["precision"],
+        "train_recall": train_metrics["recall/POD"],
+        "train_false_alarm_ratio": train_metrics["FAR"],
+        "train_tss": train_metrics["TSS"],
+        "train_hss": train_metrics["HSS"],
+        "train_f1": train_metrics["F1"],
+
+        "val_accuracy": val_metrics["acc"],
+        "val_precision": val_metrics["precision"],
+        "val_recall": val_metrics["recall/POD"],
+        "val_false_alarm_ratio": val_metrics["FAR"],
+        "val_tss": val_metrics["TSS"],
+        "val_hss": val_metrics["HSS"],
+        "val_f1": val_metrics["F1"],
     })
 
     train_dates_mpl = mdates.date2num(timestamps[train_ds.valid_indices])
     val_dates_mpl   = mdates.date2num(timestamps[val_ds.valid_indices])
+
+    PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/VIDREG10P_val_preds_seed{random_seed}.npz"
+    os.makedirs(os.path.dirname(PRED_OUT), exist_ok=True)
+
+    np.savez(
+        PRED_OUT,
+        train_true_phys = y_train_true_phys,
+        train_pred_phys = y_train_pred_phys,
+        train_dates_mpl = train_dates_mpl,
+
+        val_true_phys   = y_val_true_phys,
+        val_pred_phys   = y_val_pred_phys,
+        val_dates_mpl   = val_dates_mpl,
+
+        seed = random_seed,
+    )
+
+    print(f"saved validation predictions to {PRED_OUT}")
 
     # log train plot
     fig_train = plot_pred_vs_actual(y_train_true_phys, y_train_pred_phys, train_dates_mpl, title_prefix="Train")
@@ -593,26 +658,6 @@ def main():
     fig_val = plot_pred_vs_actual(y_val_true_phys, y_val_pred_phys, val_dates_mpl, title_prefix="Val")
     wandb.log({"val_pred_vs_actual_epilo": wandb.Image(fig_val)})
     plt.close(fig_val)
-
-    # print metrics
-    print("\nClassification statistics:\n")
-    print("---- Train ----")
-    print(f"Accuracy:           {acc_train:.4f}")
-    print(f"Precision:          {prec_train:.4f}")
-    print(f"Recall:             {rec_train:.4f}")
-    print(f"False Alarm Rate:   {far_train:.4f}")
-    print(f"TSS:                {tss_train:.4f}")
-    print(f"HSS:                {hss_train:.4f}")
-    print(f"Confusion Matrix:\n{cm_train}\n")
-
-    print("---- Validation ----")
-    print(f"Accuracy:           {acc_val:.4f}")
-    print(f"Precision:          {prec_val:.4f}")
-    print(f"Recall:             {rec_val:.4f}")
-    print(f"False Alarm Rate:   {far_val:.4f}")
-    print(f"TSS:                {tss_val:.4f}")
-    print(f"HSS:                {hss_val:.4f}")
-    print(f"Confusion Matrix:\n{cm_val}\n")
 
     wandb.finish()
     print(f"Training complete. Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")

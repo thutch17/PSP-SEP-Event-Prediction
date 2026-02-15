@@ -53,7 +53,7 @@ class WindowedDataset(Dataset):
 # model
 class ResNetBackbone(nn.Module):
     def __init__(self, in_channels=1, emb_dim=256,
-                 pretrained_path="/scratch/gpfs/th5879/model/resnet18_imagenet.pth"):
+                 pretrained_path="/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/resnet18_imagenet.pth"):
         super().__init__()
 
         self.resnet = models.resnet18(weights=None)
@@ -184,9 +184,9 @@ class SEPSeqModel(nn.Module):
 def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
 
     if cache_file is None:
-        cache_file = "/scratch/gpfs/th5879/data_collection/matched_images_171.pkl"
+        cache_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_171.pkl"
     if max_file is None:
-        max_file = "/scratch/gpfs/th5879/data_collection/matched_images_max_171.pkl"
+        max_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_171.pkl"
 
     # load cached results if available
     if os.path.exists(cache_file) and os.path.exists(max_file):
@@ -198,14 +198,15 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
         return images_all, max_val
 
     # open HDF5 file
-    with h5py.File("/scratch/gpfs/th5879/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
+    with h5py.File("/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
         times_171 = pd.to_datetime(np.array(f171["T_OBS"], dtype=str), errors='coerce')
         print(f"[DEBUG] 171 timestamps: {times_171.min()} → {times_171.max()}")
 
         images_list = []
         max_171 = 0.0
 
-        for t in tqdm(df["SDO_time"], desc="Preloading 171 images"):
+        print("preloading AIA 171 images...")
+        for t in df["SDO_time"]:
             # nearest 171 timestamp
             idx171 = np.argmin(np.abs((times_171 - t).total_seconds()))
             img171 = np.nan_to_num(f171["images"][idx171][...], nan=0.0)
@@ -234,14 +235,44 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
 def compute_metrics(y_true, y_pred):
     cm = confusion_matrix(y_true, y_pred, labels=[0,1])
     TN, FP, FN, TP = cm.ravel()
-    acc = (TP + TN) / max((TP + TN + FP + FN), 1)
+
+    total = TP + TN + FP + FN
+
+    acc = (TP + TN) / max(total, 1)
+
     precision = TP / max((TP + FP), 1)
-    recall = TP / max((TP + FN), 1)
-    far = FP / max((FP + TN), 1)
-    tss = recall - far
+    recall    = TP / max((TP + FN), 1) # probability of detection (POD)
+
+
+    FAR = FP / max((TP + FP), 1) # false alarm ratio
+    FPR = FP / max((FP + TN), 1) # false positive rate (for TSS)
+
+    # skill scores
+    TSS = recall - FPR
+
     denom = (TP + FN)*(FN + TN) + (TP + FP)*(FP + TN)
-    hss = (2*(TP*TN - FP*FN))/denom if denom != 0 else 0
-    return cm, acc, precision, recall, far, tss, hss
+    HSS = (2*(TP*TN - FP*FN))/denom if denom != 0 else 0
+
+    # F1 score
+    F1 = (2 * precision * recall / max((precision + recall), 1e-12))
+
+    return {
+        "cm": cm,
+        "acc": acc,
+        "precision": precision,
+        "recall/POD": recall,
+        "FAR": FAR,
+        "TSS": TSS,
+        "HSS": HSS,
+        "F1": F1,
+        "TP": TP,
+        "FP": FP,
+        "TN": TN,
+        "FN": FN,
+    }
+
+def count_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def plot_confusion_matrix(cm, title="Confusion Matrix"):
     fig, ax = plt.subplots(figsize=(5,4))
@@ -253,27 +284,31 @@ def plot_confusion_matrix(cm, title="Confusion Matrix"):
 
 # main
 def main():
-    CSV_PATH = "/scratch/gpfs/th5879/data_collection/final_psp_df_3hr_cadence.csv"
+    print("VIDEO CLASSIFICATION")
+    CSV_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/final_psp_df_3hr_cadence.csv"
     df = pd.read_csv(CSV_PATH)
     df['SDO_time'] = pd.to_datetime(df['SDO_time'])
     df = df[df["photo_captures_footprint"] != 0].reset_index(drop=True)
-    df = df.dropna(subset=["epilo_jlinlin_offset"]).reset_index(drop=True)
+    df = df.dropna(subset=["epilo_jlinlin_offset_10x"]).reset_index(drop=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=0.00005)
+    parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--window_size", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=1717)
     args = parser.parse_args()
 
     epochs = args.epochs
     batch_size = args.batch_size
     learning_rate = args.learning_rate
     window_size = args.window_size
+    random_seed = args.seed
 
     name = (
-        f"TIMECLASSep{epochs}_bs{batch_size}_lr{learning_rate}_winsize{window_size}"
+        f"TCLASS10Pep{epochs}_bs{batch_size}_lr{learning_rate}_winsize{window_size}_seed{random_seed}"
     )
+    print("training:", name)
     os.environ["WANDB_MODE"] = "offline"
 
     wandb.init(
@@ -290,7 +325,13 @@ def main():
 
     # binary targets
     threshold = 1e-1
-    y = (df["epilo_jlinlin_offset"].values > threshold).astype(np.float32)
+    y = (df["epilo_jlinlin_offset_10x"].values > threshold).astype(np.float32)
+    num_ones = np.sum(y == 1)
+    num_zeros = np.sum(y == 0)
+
+    print(f"Number of positives (1): {num_ones}")
+    print(f"Number of negatives (0): {num_zeros}")
+    print(f"Positive fraction: {num_ones / len(y):.4f}")
     aux_features = np.stack([
         df["psp_footpoint_stonyhurst_lon"].values.astype(np.float32)/180.0,
         df["psp_ephem_features_HCI_R"].values.astype(np.float32)
@@ -301,7 +342,7 @@ def main():
 
     all_indices = np.arange(len(df))
     blocks = [all_indices[i:i+80] for i in range(0, len(all_indices), 80)]
-    rng = np.random.default_rng(seed=1717)
+    rng = np.random.default_rng(seed=random_seed)
     rng.shuffle(blocks)
     train_cutoff = int(0.8*len(blocks))
     train_idx = np.concatenate([block for block in blocks[:train_cutoff]])
@@ -327,7 +368,9 @@ def main():
 
     best_val_loss = float("inf")
     best_epoch = 0
-    MODEL_OUT = f"/scratch/gpfs/th5879/model/models/sep_{name}.pt"
+    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_{name}.pt"
+    num_params = count_trainable_params(model)
+    print(f"Number of trainable parameters: {num_params:,}")
 
     # train model for specified epochs
     for epoch in range(epochs):
@@ -416,32 +459,34 @@ def main():
     y_val_pred   = (np.concatenate([yp.reshape(-1) for yp in y_val_pred]) > 0.0).astype(int)
 
     # compute metrics
-    cm_train, acc_train, prec_train, rec_train, far_train, tss_train, hss_train = compute_metrics(y_train_true, y_train_pred)
-    cm_val, acc_val, prec_val, rec_val, far_val, tss_val, hss_val = compute_metrics(y_val_true, y_val_pred)
+    train_metrics = compute_metrics(y_train_true, y_train_pred)
+    val_metrics   = compute_metrics(y_val_true, y_val_pred)
 
     # print metrics
     print("\nClassification statistics:\n")
     print("---- Train ----")
-    print(f"Accuracy:           {acc_train:.4f}")
-    print(f"Precision:          {prec_train:.4f}")
-    print(f"Recall:             {rec_train:.4f}")
-    print(f"False Alarm Rate:   {far_train:.4f}")
-    print(f"TSS:                {tss_train:.4f}")
-    print(f"HSS:                {hss_train:.4f}")
-    print(f"Confusion Matrix:\n{cm_train}\n")
+    print(f"Accuracy:           {train_metrics['acc']:.4f}")
+    print(f"Precision:          {train_metrics['precision']:.4f}")
+    print(f"Recall (POD):       {train_metrics['recall/POD']:.4f}")
+    print(f"False Alarm Ratio:  {train_metrics['FAR']:.4f}")
+    print(f"TSS:                {train_metrics['TSS']:.4f}")
+    print(f"HSS:                {train_metrics['HSS']:.4f}")
+    print(f"F1:                 {train_metrics['F1']:.4f}")
+    print(f"Confusion Matrix:\n{train_metrics['cm']}\n")
 
     print("---- Validation ----")
-    print(f"Accuracy:           {acc_val:.4f}")
-    print(f"Precision:          {prec_val:.4f}")
-    print(f"Recall:             {rec_val:.4f}")
-    print(f"False Alarm Rate:   {far_val:.4f}")
-    print(f"TSS:                {tss_val:.4f}")
-    print(f"HSS:                {hss_val:.4f}")
-    print(f"Confusion Matrix:\n{cm_val}\n")
+    print(f"Accuracy:           {val_metrics['acc']:.4f}")
+    print(f"Precision:          {val_metrics['precision']:.4f}")
+    print(f"Recall (POD):       {val_metrics['recall/POD']:.4f}")
+    print(f"False Alarm Ratio:  {val_metrics['FAR']:.4f}")
+    print(f"TSS:                {val_metrics['TSS']:.4f}")
+    print(f"HSS:                {val_metrics['HSS']:.4f}")
+    print(f"F1:                 {val_metrics['F1']:.4f}")
+    print(f"Confusion Matrix:\n{val_metrics['cm']}\n")
 
     # plot confusion matrices
-    fig_train_cm = plot_confusion_matrix(cm_train, "Train Confusion Matrix")
-    fig_val_cm = plot_confusion_matrix(cm_val, "Validation Confusion Matrix")
+    fig_train_cm = plot_confusion_matrix(train_metrics["cm"], "Train Confusion Matrix")
+    fig_val_cm   = plot_confusion_matrix(val_metrics["cm"], "Validation Confusion Matrix")
     plt.show()
 
     wandb.log({
@@ -449,18 +494,21 @@ def main():
         "val_confusion_matrix": wandb.Image(fig_val_cm),
     })
     wandb.log({
-        "train_accuracy": acc_train,
-        "train_precision": prec_train,
-        "train_recall": rec_train,
-        "train_false_alarm_rate": far_train,
-        "train_tss": tss_train,
-        "train_hss": hss_train,
-        "val_accuracy": acc_val,
-        "val_precision": prec_val,
-        "val_recall": rec_val,
-        "val_false_alarm_rate": far_val,
-        "val_tss": tss_val,
-        "val_hss": hss_val
+    "train_accuracy": train_metrics["acc"],
+    "train_precision": train_metrics["precision"],
+    "train_recall": train_metrics["recall/POD"],
+    "train_false_alarm_ratio": train_metrics["FAR"],
+    "train_tss": train_metrics["TSS"],
+    "train_hss": train_metrics["HSS"],
+    "train_f1": train_metrics["F1"],
+
+    "val_accuracy": val_metrics["acc"],
+    "val_precision": val_metrics["precision"],
+    "val_recall": val_metrics["recall/POD"],
+    "val_false_alarm_ratio": val_metrics["FAR"],
+    "val_tss": val_metrics["TSS"],
+    "val_hss": val_metrics["HSS"],
+    "val_f1": val_metrics["F1"],
     })
 
 
