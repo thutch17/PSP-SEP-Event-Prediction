@@ -8,6 +8,7 @@ import time
 from PIL import Image
 import re
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # downsample to 512x512 pixels
 def downsample_image(image, factor=8):
@@ -22,7 +23,7 @@ def downsample_image(image, factor=8):
 # process an individual file
 def process_fits_file(filepath, downsample_factor=8):
     """Load FITS image and header, downsample, extract timestamp, optionally save PNG."""
-    print('processing',filepath)
+    # print('processing',filepath)
     image_data, header = fits.getdata(filepath, header=True)
     image_data = image_data.astype(np.float32)
     if downsample_factor > 1:
@@ -40,22 +41,21 @@ def process_fits_file(filepath, downsample_factor=8):
 def process_fits_directory(input_dir, h5_path, downsample_factor=8):
     """Process all FITS files in a directory and save images + timestamps to HDF5."""
     # filter out corruped images at 21:00 exactly
-    corrupted = re.compile(r"T2100\d{2}Z")
-    all_files_before = [
+    # corrupted = re.compile(r"T2100\d{2}Z")
+    all_files = sorted([
         os.path.join(root, f)
         for root, _, files in os.walk(input_dir)
         for f in files if f.endswith(".fits")
-    ]
-    print("Total FITS before excluding corrupted regex:", len(all_files_before))
-    print("Applying regex:", corrupted.pattern)
+    ])
+    # print("Total FITS before excluding corrupted regex:", len(all_files_before))
+    # print("Applying regex:", corrupted.pattern)
 
-    all_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(input_dir)
-        for f in files if f.endswith(".fits") and not corrupted.search(f)
-    ]
+    # all_files = [
+    #     os.path.join(root, f)
+    #     for root, _, files in os.walk(input_dir)
+    #     for f in files if f.endswith(".fits") and not corrupted.search(f)
+    # ]
 
-    print("Total FITS *after* excluding corrupted:", len(all_files))
     num_files = len(all_files)
     print(f"Found {num_files} FITS files")
     start_time = time.time()
@@ -69,7 +69,7 @@ def process_fits_directory(input_dir, h5_path, downsample_factor=8):
         filenames = h5f.create_dataset("filenames", (num_files,), dtype=dt_str)
         timestamps = h5f.create_dataset("T_OBS", (num_files,), dtype=dt_str)
 
-        for i, fpath in enumerate(all_files, start=1):
+        for i, fpath in enumerate(tqdm(all_files), start=1):
             try:
                 metadata, image_data = process_fits_file(fpath, downsample_factor=downsample_factor)
 
@@ -92,18 +92,26 @@ def process_fits_directory(input_dir, h5_path, downsample_factor=8):
             except Exception as e:
                 print(f"Error processing {fpath}: {e}")
 
-            # progress updates
-            if i % 20 == 0 or i == num_files:
-                elapsed = time.time() - start_time
-                avg_time_per_file = elapsed / i
-                remaining = avg_time_per_file * (num_files - i)
-                print(f'Progress: {i / num_files * 100:.2f}% | '
-                      f'ETA: {remaining / 60:.1f} min')
-
     print(f"saved {count} images with timestamps to {h5_path}")
 
 
-input_dir = "/scratch/gpfs/sk6617/SDO_data_Tate/AIA304/"
-h5_path = "aia304_images_3hr_cadence_no_corrupted.h5"
+# input_dir_094 = "/scratch/gpfs/DMCCOMAS/SDO/AIA094/"
+# h5_path_094 = "aia094_images_3hr_cadence.h5"
 
-process_fits_directory(input_dir, h5_path, downsample_factor=8)
+# input_dir_193 = "/scratch/gpfs/DMCCOMAS/SDO/AIA193/"
+# h5_path_193 = "aia193_images_3hr_cadence.h5"
+
+input_dir_131 = "/scratch/gpfs/DMCCOMAS/SDO/AIA131/"
+h5_path_131 = "aia131_images_3hr_cadence.h5"
+
+# input_dir_211 = "/scratch/gpfs/DMCCOMAS/SDO/AIA211/"
+# h5_path_211 = "aia211_images_3hr_cadence.h5"
+
+# input_dir_193 = "/scratch/gpfs/DMCCOMAS/SDO/AIA193/"
+# h5_path_193 = "aia193_images_3hr_cadence.h5"
+
+# process_fits_directory(input_dir_094, h5_path_094, downsample_factor=8)
+# process_fits_directory(input_dir_193, h5_path_193, downsample_factor=8)
+process_fits_directory(input_dir_131, h5_path_131, downsample_factor=8)
+# process_fits_directory(input_dir_211, h5_path_211, downsample_factor=8)
+# process_fits_directory(input_dir_193, h5_path_193, downsample_factor=8)

@@ -1,4 +1,4 @@
-# usage: python snapshotmodel.py
+# usage: python snapshotclassificationmodel.py
 # pass in hyperparameters in argparse or change in code
 
 import os
@@ -25,7 +25,7 @@ import wandb
 
 import argparse
 
-print("SNAPSHOT MODEL")
+print("SNAPSHOT CLASSIFICATION MODEL")
 parser = argparse.ArgumentParser(
     description="Train SEP prediction model using PSP and SDO/AIA data."
 )
@@ -48,6 +48,8 @@ parser.add_argument("--train_fraction", type=float, default=1,
                     help="Fraction of each training block to use (0 < p <= 1)")
 parser.add_argument("--seed", type=int, default=1717,
                     help="random seed for train/test split")
+parser.add_argument("--wavelength", type=int, default=171,
+                    help="SDO/AIA wavelength (e.g., 94, 131, 171, 193, 211, 304, 335)")
 
 args = parser.parse_args()
 
@@ -60,6 +62,7 @@ dropout_rate = args.dropout
 train_block_size = args.train_block_size
 train_fraction = args.train_fraction
 seed = args.seed
+wavelength = args.wavelength
 
 print(f"""
 === training configuration ===
@@ -124,7 +127,7 @@ def plot_confusion_matrix(cm, title="Confusion Matrix"):
 def count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-name = f"SS10Pep{epochs}_bs{batch_size}_lr{learning_rate}_dense{num_dense}_conv{num_conv}_drop{dropout_rate}_trainbatch{train_block_size}_seed{seed}"
+name = f"SSCLASS_{wavelength}A_ep{epochs}_bs{batch_size}_lr{learning_rate}_dense{num_dense}_conv{num_conv}_drop{dropout_rate}_trainbatch{train_block_size}_seed{seed}"
 print("training:", name)
 
 os.environ["WANDB_MODE"] = "offline"
@@ -143,15 +146,16 @@ wandb.init(
         "optimizer": "adam",
         "learning_rate": learning_rate,
         "architecture": f"{num_conv}conv+pos+dense{num_dense}+dropout{dropout_rate}",
-        "loss": "mse",
-        "dropout_rate": dropout_rate
+        "loss": "BCEWithLogitsLoss",
+        "dropout_rate": dropout_rate,
+        "wavelength": wavelength
     }
 )
 
 # data loading and preprocessing
-H5_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5"
+H5_PATH = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia{wavelength}_images_3hr_cadence.h5"
 CSV_PATH = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/final_psp_df_3hr_cadence.csv"
-MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_prediction_{name}.pt"
+MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/{name}.pt"
 
 print("loading PSP dataframe...")
 df = pd.read_csv(CSV_PATH)
@@ -218,12 +222,18 @@ r_feature = df["psp_ephem_features_HCI_R"].values.astype(np.float32)
 # concatenate both scalars into one tensor
 aux_features = np.concatenate([pos, r_feature.reshape(-1, 1)], axis=1)
 
-# log normalize the prediction targets
-y_full = df[["epilo_jlinlin_offset_10x"]].values.astype(np.float32)  # only epilo
-y_log = np.log1p(y_full)
-y_mean = np.mean(y_log, axis=0)
-y_std = np.std(y_log, axis=0)
-y = (y_log - y_mean) / y_std
+lon_raw = df["psp_footpoint_stonyhurst_lon"].values.astype(np.float32)
+r_raw   = r_feature
+
+# binary targets
+threshold = 1e-1
+y = (df["epilo_jlinlin_offset_10x"].values > threshold).astype(np.float32)
+num_ones = np.sum(y == 1)
+num_zeros = np.sum(y == 0)
+
+print(f"Number of positives (1): {num_ones}")
+print(f"Number of negatives (0): {num_zeros}")
+print(f"Positive fraction: {num_ones / len(y):.4f}")
 
 # store original order for plotting
 X_orig = X.copy()
@@ -280,10 +290,9 @@ val_ds = TensorDataset(X_val_t, aux_val_t, y_val_t)
 train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-print("Checking X, y, aux for NaNs/Infs...")
-print("X:", np.isnan(X).sum(), "y:", np.isnan(y).sum(), "aux_features:", np.isnan(aux_features).sum())
+print("Checking X, aux for NaNs/Infs...")
+print("X:", np.isnan(X).sum(), "aux_features:", np.isnan(aux_features).sum())
 print("X max/min:", X.max(), X.min())
-print("y max/min:", y.max(), y.min())
 print("aux_features max/min:", aux_features.max(), aux_features.min())
 
 # define pytorch CNN model
@@ -320,11 +329,15 @@ class SEPModel(nn.Module):
 
 model = SEPModel(num_conv, num_dense, dropout_rate).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-criterion = nn.MSELoss()
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, 
-    T_max=epochs,
-    eta_min=1e-7
+
+num_pos = y.sum()
+num_neg = len(y) - num_pos
+pos_weight = torch.tensor(num_neg / max(num_pos, 1), dtype=torch.float32).to(device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min', factor=0.5, patience=5, min_lr=1e-6
 )
 
 print(model)
@@ -338,7 +351,7 @@ for epoch in range(epochs):
     model.train()
     train_losses = []
     for Xb, auxb, yb in train_loader:
-        Xb, auxb, yb = Xb.to(device), auxb.to(device), yb.to(device)
+        Xb, auxb, yb = Xb.to(device), auxb.to(device), yb.view(-1, 1).to(device)
         optimizer.zero_grad()
         preds = model(Xb, auxb)
         loss = criterion(preds, yb)
@@ -350,190 +363,82 @@ for epoch in range(epochs):
     val_losses = []
     with torch.no_grad():
         for Xb, auxb, yb in val_loader:
-            Xb, auxb, yb = Xb.to(device), auxb.to(device), yb.to(device)
+            Xb, auxb, yb = Xb.to(device), auxb.to(device), yb.view(-1, 1).to(device)
             preds = model(Xb, auxb)
             loss = criterion(preds, yb)
             val_losses.append(loss.item())
 
     train_loss = np.mean(train_losses)
     val_loss = np.mean(val_losses)
-    scheduler.step()
+    scheduler.step(val_loss)
     wandb.log({
         "train_loss": train_loss,
         "val_loss": val_loss,
         "epoch": epoch,
-        "lr": scheduler.get_last_lr()[0]
     })
 
-    print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.3e}  val_loss={val_loss:.3e}  lr={scheduler.get_last_lr()[0]:.2e}")
+    print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
 
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         torch.save(model.state_dict(), MODEL_OUT)
         best_epoch = epoch
-    elif epoch - best_epoch > 50:
-        print(f"EARLY STOPPING")
+    elif epoch - best_epoch > 30:
+        print(f"No improvement after 30 epochs, stopping early.")
         break
 
-print(f"Best validation loss: {best_val_loss:.3e}")
+print(f"Best validation loss: {best_val_loss:.4f}")
 print(f"saved model to {MODEL_OUT}")
 
 # evaluation and plotting
-def invert_log_scaling(y_scaled):
-    y_log = y_scaled * y_std + y_mean
-    return np.expm1(y_log)
-
 model.load_state_dict(torch.load(MODEL_OUT))
 model.eval()
 
+# containers
+y_train_pred, y_train_true = [], []
+y_val_pred, y_val_true = [], []
+
 with torch.no_grad():
-    y_train_pred = []
-    for Xb, auxb, _ in train_loader:
-        Xb, auxb = Xb.to(device), auxb.to(device)
-        preds = model(Xb, auxb)
+    # train evaluation
+    for Xb, auxb, yb in train_loader:
+        preds = model(Xb.to(device), auxb.to(device))
         y_train_pred.append(preds.cpu().numpy())
-    y_train_pred = np.vstack(y_train_pred)
+        y_train_true.append(yb.numpy())
 
-    y_val_pred = []
-    for Xb, auxb, _ in val_loader:
-        Xb, auxb = Xb.to(device), auxb.to(device)
-        preds = model(Xb, auxb)
+    # val evaluation
+    for Xb, auxb, yb in val_loader:
+        preds = model(Xb.to(device), auxb.to(device))
         y_val_pred.append(preds.cpu().numpy())
-    y_val_pred = np.vstack(y_val_pred)
+        y_val_true.append(yb.numpy())
 
-y_train_true_phys = invert_log_scaling(y_train)
-y_val_true_phys = invert_log_scaling(y_val)
-y_train_pred_phys = invert_log_scaling(y_train_pred)
-y_val_pred_phys = invert_log_scaling(y_val_pred)
+with torch.no_grad():
+    y_train_pred_raw = []
+    for Xb, auxb, yb in train_loader:
+        preds = model(Xb.to(device), auxb.to(device))
+        y_train_pred_raw.append(preds.cpu().numpy())
 
-# scatter coloring by date
-train_dates_mpl = mdates.date2num(pd.to_datetime(df.loc[train_idx, "SDO_time"]))
-val_dates_mpl = mdates.date2num(pd.to_datetime(df.loc[val_idx, "SDO_time"]))
+    # stack into a single array
+    y_train_pred_raw = np.concatenate([yp.reshape(-1) for yp in y_train_pred_raw])
 
-# plot actual vs. predicted
-for i, name in enumerate(["epilo"]):
-    mask_train = (y_train_true_phys[:, i] > 0) & (y_train_pred_phys[:, i] > 0)
-    fig_train, ax_train = plt.subplots(figsize=(6,6))
-    sc = ax_train.scatter(
-        y_train_true_phys[mask_train, i],
-        y_train_pred_phys[mask_train, i],
-        c=train_dates_mpl[mask_train],
-        cmap='viridis',
-        alpha=0.7
-    )
-    lims = [y_train_true_phys[mask_train, i].min(), y_train_true_phys[mask_train, i].max()]
-    ax_train.plot(lims, lims, 'r--')
-    ax_train.set_xscale('log')
-    ax_train.set_yscale('log')
-    ax_train.set_xlabel(f"Actual {name}")
-    ax_train.set_ylabel(f"Predicted {name}")
-    ax_train.set_title(f"Train: Predicted vs Actual {name} (colored by date)")
-    ax_train.grid(True, which="both", ls="--")
-    cbar = fig_train.colorbar(sc, ax=ax_train)
-    cbar.set_label("Date")
-    cbar.ax.yaxis.set_major_locator(mdates.AutoDateLocator())
-    cbar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    wandb.log({f"train_pred_vs_actual_{name}": wandb.Image(fig_train)})
-    plt.close(fig_train)
+    # check min/max/mean values
+    print("Train predictions (raw):")
+    print("min:", y_train_pred_raw.min())
+    print("max:", y_train_pred_raw.max())
+    print("mean:", y_train_pred_raw.mean())
+    print("first 20:", y_train_pred_raw[:20])
 
-    mask_val = (y_val_true_phys[:, i] > 0) & (y_val_pred_phys[:, i] > 0)
-    fig_val, ax_val = plt.subplots(figsize=(6,6))
-    sc = ax_val.scatter(
-        y_val_true_phys[mask_val, i],
-        y_val_pred_phys[mask_val, i],
-        c=val_dates_mpl[mask_val],
-        cmap='viridis',
-        alpha=0.7
-    )
-    lims = [y_val_true_phys[mask_val, i].min(), y_val_true_phys[mask_val, i].max()]
-    ax_val.plot(lims, lims, 'r--')
-    ax_val.set_xscale('log')
-    ax_val.set_yscale('log')
-    ax_val.set_xlabel(f"Actual {name}")
-    ax_val.set_ylabel(f"Predicted {name}")
-    ax_val.set_title(f"Snapshot: Actual vs. Predicted Jlinlin")
-    ax_val.grid(True, which="both", ls="--")
-    cbar = fig_val.colorbar(sc, ax=ax_val)
-    cbar.set_label("Date")
-    cbar.ax.yaxis.set_major_locator(mdates.AutoDateLocator())
-    cbar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    wandb.log({f"val_pred_vs_actual_{name}": wandb.Image(fig_val)})
-    plt.close(fig_val)
+# stack into arrays
+y_train_true = np.concatenate([yb.reshape(-1) for yb in y_train_true]).astype(int)
+y_val_true   = np.concatenate([yb.reshape(-1) for yb in y_val_true]).astype(int)
 
-test_dates = [
-    # maxima
-    "2023-07-25",
-    # minima
-    "2020-09-02",
-    # two random ones
-    "2021-08-27",
-    "2024-08-27"
-]
+# convert logits to 0/1 predictions
+y_train_pred = (np.concatenate([yp.reshape(-1) for yp in y_train_pred]) > 0.0).astype(int)
+y_val_pred   = (np.concatenate([yp.reshape(-1) for yp in y_val_pred]) > 0.0).astype(int)
 
-# plot for specific test dates
-for j, date_str in enumerate(test_dates):
-    date_start = pd.Timestamp(date_str)
-    date_end = date_start + pd.Timedelta(days=1)
+# compute metrics
+train_metrics = compute_metrics(y_train_true, y_train_pred)
+val_metrics   = compute_metrics(y_val_true, y_val_pred)
 
-    mask_date = (df["SDO_time"] >= date_start) & (df["SDO_time"] < date_end)
-    subset_df = df[mask_date].sort_values("SDO_time")
-
-    if len(subset_df) == 0:
-        print(f"No data found for {date_str}")
-        continue
-
-    subset_idx = subset_df.index.values
-    X_sub = torch.tensor(X_orig[subset_idx].transpose(0,3,1,2), dtype=torch.float32).to(device)
-    aux_sub = torch.tensor(aux_orig[subset_idx], dtype=torch.float32).to(device)
-    y_true_sub = y_orig[subset_idx]
-
-    with torch.no_grad():
-        y_pred_sub = model(X_sub, aux_sub).cpu().numpy()
-
-    y_true_phys = invert_log_scaling(y_true_sub)
-    y_pred_phys = invert_log_scaling(y_pred_sub)
-    times_sub = pd.to_datetime(subset_df["SDO_time"])
-
-    n = len(subset_idx)
-    fig = plt.figure(figsize=(2.5 * n, 6))
-    gs = gridspec.GridSpec(2, n, height_ratios=[3, 2])
-
-    fig.suptitle(f"SEP Prediction on {date_start.date()} (3h cadence)", fontsize=14)
-
-    for i in range(n):
-        ax_img = fig.add_subplot(gs[0, i])
-        img = np.expm1(X_orig[subset_idx[i], ..., 0] * X_max)
-        im = ax_img.imshow(img, cmap="inferno", origin="lower")
-        ax_img.set_title(times_sub.iloc[i].strftime("%H:%M"), fontsize=8)
-        ax_img.axis("off")
-
-    ax_plot = fig.add_subplot(gs[1, :])
-    ax_plot.plot(times_sub, y_true_phys[:, 0], "o-", label="Actual Jlinlin", color="C0")
-    ax_plot.plot(times_sub, y_pred_phys[:, 0], "s--", label="Predicted Jlinlin", color="C1")
-    ax_plot.set_yscale("log")
-    ax_plot.set_xlabel("Time (UT)")
-    ax_plot.set_ylabel("epilo flux")
-    ax_plot.grid(True, which="both", ls="--", alpha=0.4)
-    ax_plot.legend()
-    ax_plot.xaxis.set_major_formatter(DateFormatter("%H:%M"))
-    ax_plot.set_xlim(times_sub.min(), times_sub.max())
-
-    plt.tight_layout(rect=[0, 0, 0.9, 0.93])
-    wandb.log({f"qualitative_{date_str}": wandb.Image(fig)}, commit=True)
-    plt.close(fig)
-
-
-# binary classification transformation
-threshold = 1e-1
-
-y_train_pred_bin = (y_train_pred_phys[:, 0] > threshold).astype(int)
-y_train_true_bin = (y_train_true_phys[:, 0] > threshold).astype(int)
-
-y_val_pred_bin = (y_val_pred_phys[:, 0] > threshold).astype(int)
-y_val_true_bin = (y_val_true_phys[:, 0] > threshold).astype(int)
-
-train_metrics = compute_metrics(y_train_true_bin, y_train_pred_bin)
-val_metrics   = compute_metrics(y_val_true_bin, y_val_pred_bin)
 print("\nClassification statistics:\n")
 print("---- Train ----")
 print(f"Accuracy:           {train_metrics['acc']:.4f}")
@@ -554,6 +459,7 @@ print(f"TSS:                {val_metrics['TSS']:.4f}")
 print(f"HSS:                {val_metrics['HSS']:.4f}")
 print(f"F1:                 {val_metrics['F1']:.4f}")
 print(f"Confusion Matrix:\n{val_metrics['cm']}\n")
+
 fig_train_cm = plot_confusion_matrix(train_metrics["cm"], "Train Confusion Matrix")
 fig_val_cm   = plot_confusion_matrix(val_metrics["cm"], "Validation Confusion Matrix")
 plt.show()
@@ -580,18 +486,25 @@ wandb.log({
     "val_confusion_matrix": wandb.Image(fig_val_cm),
 })
 
-PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/SS10P_val_preds_seed{seed}.npz"
+PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/{name}.npz"
 os.makedirs(os.path.dirname(PRED_OUT), exist_ok=True)
+
+train_dates_mpl = mdates.date2num(pd.to_datetime(df.loc[train_idx, "SDO_time"]))
+val_dates_mpl   = mdates.date2num(pd.to_datetime(df.loc[val_idx, "SDO_time"]))
 
 np.savez(
     PRED_OUT,
-    train_true_phys = y_train_true_phys,
-    train_pred_phys = y_train_pred_phys,
+    train_true      = y_train_true,
+    train_pred      = y_train_pred,
     train_dates_mpl = train_dates_mpl,
+    train_lon       = lon_raw[train_idx],
+    train_r         = r_raw[train_idx],
 
-    val_true_phys   = y_val_true_phys,
-    val_pred_phys   = y_val_pred_phys,
+    val_true        = y_val_true,
+    val_pred        = y_val_pred,
     val_dates_mpl   = val_dates_mpl,
+    val_lon         = lon_raw[val_idx],
+    val_r           = r_raw[val_idx],
 
     seed = seed,
 )
@@ -602,4 +515,3 @@ plt.close(fig_train_cm)
 plt.close(fig_val_cm)
 
 wandb.finish()
-

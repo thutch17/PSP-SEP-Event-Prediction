@@ -191,17 +191,12 @@ class SEPSeqModel(nn.Module):
             return self.classifier(out)
         return out
 
-def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
-    """
-    Load AIA171 images corresponding to the PSP dataframe, normalize, and cache.
-    Returns:
-        images_all: np.array of shape (N, 1, H, W), log-normalized to [0,1]
-        max_val: scalar maximum value used for normalization
-    """
+def preload_matched_images_into_memory(df, wavelength=171, cache_file=None, max_file=None):
+
     if cache_file is None:
-        cache_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_171.pkl"
+        cache_file = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_{wavelength}.pkl"
     if max_file is None:
-        max_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_171.pkl"
+        max_file = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_{wavelength}.pkl"
 
     # load cached results if available
     if os.path.exists(cache_file) and os.path.exists(max_file):
@@ -209,29 +204,29 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
             images_all = pickle.load(f)
         with open(max_file, 'rb') as f:
             max_val = pickle.load(f)
-        print(f"[DEBUG] Loaded cached 171 images ({len(images_all)})")
+        print(f"[DEBUG] Loaded cached h5 images ({len(images_all)})")
         return images_all, max_val
 
     # open HDF5 file
-    with h5py.File("/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
-        times_171 = pd.to_datetime(np.array(f171["T_OBS"], dtype=str), errors='coerce')
-        print(f"[DEBUG] 171 timestamps: {times_171.min()} → {times_171.max()}")
+    with h5py.File(f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia{wavelength}_images_3hr_cadence.h5", "r") as f_h5:
+        times_h5 = pd.to_datetime(np.array(f_h5["T_OBS"], dtype=str), errors='coerce')
+        print(f"[DEBUG] {wavelength} timestamps: {times_h5.min()} → {times_h5.max()}")
 
         images_list = []
-        max_171 = 0.0
+        max_h5 = 0.0
 
-        print("preloading 171 images...")
+        print(f"preloading AIA {wavelength} images...")
         for t in df["SDO_time"]:
-            # nearest 171 timestamp
-            idx171 = np.argmin(np.abs((times_171 - t).total_seconds()))
-            img171 = np.nan_to_num(f171["images"][idx171][...], nan=0.0)
-            img171 = np.clip(img171, 0, None)
-            max_171 = max(max_171, img171.max())
-            images_list.append(img171)
+            # nearest timestamp
+            idx_h5 = np.argmin(np.abs((times_h5 - t).total_seconds()))
+            img_h5 = np.nan_to_num(f_h5["images"][idx_h5][...], nan=0.0)
+            img_h5 = np.clip(img_h5, 0, None)
+            max_h5 = max(max_h5, img_h5.max())
+            images_list.append(img_h5)
 
         # log-normalize
         images_all = np.array([
-            np.log1p(img) / np.log1p(max_171) for img in images_list
+            np.log1p(img) / np.log1p(max_h5) for img in images_list
         ], dtype=np.float16)
 
         # add channel dim: (N, 1, H, W)
@@ -241,10 +236,10 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
     with open(cache_file, 'wb') as f:
         pickle.dump(images_all, f)
     with open(max_file, 'wb') as f:
-        pickle.dump(max_171, f)
+        pickle.dump(max_h5, f)
 
-    print(f"[DEBUG] Loaded {len(images_all)} 171 images, max_val={max_171:.3f}")
-    return images_all, max_171
+    print(f"[DEBUG] Loaded {len(images_all)} {wavelength} images, max_val={max_h5:.3f}")
+    return images_all, max_h5
 
 def invert_log_scaling(y_scaled, y_mean, y_std):
     # y_log = y_scaled * y_std + y_mean
@@ -342,7 +337,11 @@ def main():
     parser.add_argument("--train_block_size", type=int, default=80, help="Training block size")
     parser.add_argument("--train_fraction", type=float, default=1, help="Fraction of each training block to use (0 < p <= 1)")
     parser.add_argument("--window_size", type=int, default=8, help="Window size")
+    parser.add_argument("--n_heads", type=int, default=4, help="Number of transformer attention heads")
+    parser.add_argument("--n_attn_blocks", type=int, default=3, help="Number of transformer encoder blocks")
+    parser.add_argument("--hidden_head", type=int, default=256, help="Transformer hidden dimension")
     parser.add_argument("--seed", type=int, default=1717, help="Window size")
+    parser.add_argument("--wavelength", type=int, default=171)
 
 
     args = parser.parse_args()
@@ -354,7 +353,11 @@ def main():
     train_block_size = args.train_block_size
     train_fraction = args.train_fraction
     window_size = args.window_size
+    n_heads = args.n_heads
+    n_attn_blocks = args.n_attn_blocks
+    hidden_head = args.hidden_head
     random_seed = args.seed
+    wavelength = args.wavelength
 
     print(f"""
     === training configuration ===
@@ -365,12 +368,18 @@ def main():
     train_block_size:  {train_block_size}
     train_fraction:    {train_fraction}
     window_size:       {window_size}
+    n_heads:           {n_heads}
+    n_attn_blocks:     {n_attn_blocks}
+    hidden_head:       {hidden_head}
+    wavelength:        {wavelength}
     ==============================
     """)
 
     name = (
-        f"TREG10Pep{epochs}_bs{batch_size}_lr{learning_rate}"
-        f"_drop{dropout_rate}_trainbatch{train_block_size}_seed{random_seed}"
+        f"TREG_{wavelength}_ep{epochs}_bs{batch_size}_lr{learning_rate}"
+        f"_drop{dropout_rate}_trainbatch{train_block_size}"
+        f"_heads{n_heads}_blocks{n_attn_blocks}_hidden{hidden_head}"
+        f"_seed{random_seed}"
     )
     print("training:", name)
     MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_prediction_{name}.pt"
@@ -389,6 +398,9 @@ def main():
             "learning_rate": learning_rate,
             "loss": "mse",
             "dropout_rate": dropout_rate,
+            "n_heads": n_heads,
+            "n_attn_blocks": n_attn_blocks,
+            "hidden_head": hidden_head,
         }
     )
 
@@ -403,7 +415,10 @@ def main():
     aux_r = df["psp_ephem_features_HCI_R"].values.astype(np.float32)
     aux_features = np.stack([aux_lon, aux_r], axis=1)  # shape (N, 2)
 
-    images_all, max_val = preload_matched_images_into_memory(df)
+    lon_raw = df["psp_footpoint_stonyhurst_lon"].values.astype(np.float32)
+    r_raw   = aux_r
+
+    images_all, max_val = preload_matched_images_into_memory(df, wavelength=wavelength)
     # valid indices after filtering
     all_indices = np.arange(0, len(df)) 
     T = window_size
@@ -452,13 +467,13 @@ def main():
 
     # model definition
     model = SEPSeqModel(
-        image_channels=1, # just 171 for now
+        image_channels=1,
         image_emb=256,
         aux_dim=2,
         aux_emb=32,
-        n_heads=4,
-        n_attn_blocks=3,
-        hidden_head=256,
+        n_heads=n_heads,
+        n_attn_blocks=n_attn_blocks,
+        hidden_head=hidden_head,
         dropout=dropout_rate,
         use_binary=False,
         window_size=window_size
@@ -473,7 +488,7 @@ def main():
     # training loop with early stopping
     best_val_loss = float("inf")
     best_epoch = 0
-    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_time{name}.pt"
+    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/{name}.pt"
     print("starting training")
 
     for epoch in range(epochs):
@@ -631,7 +646,7 @@ def main():
     train_dates_mpl = mdates.date2num(timestamps[train_ds.valid_indices])
     val_dates_mpl   = mdates.date2num(timestamps[val_ds.valid_indices])
 
-    PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/VIDREG10P_val_preds_seed{random_seed}.npz"
+    PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/{name}.npz"
     os.makedirs(os.path.dirname(PRED_OUT), exist_ok=True)
 
     np.savez(
@@ -639,10 +654,14 @@ def main():
         train_true_phys = y_train_true_phys,
         train_pred_phys = y_train_pred_phys,
         train_dates_mpl = train_dates_mpl,
+        train_lon       = lon_raw[train_ds.valid_indices],
+        train_r         = r_raw[train_ds.valid_indices],
 
         val_true_phys   = y_val_true_phys,
         val_pred_phys   = y_val_pred_phys,
         val_dates_mpl   = val_dates_mpl,
+        val_lon         = lon_raw[val_ds.valid_indices],
+        val_r           = r_raw[val_ds.valid_indices],
 
         seed = random_seed,
     )

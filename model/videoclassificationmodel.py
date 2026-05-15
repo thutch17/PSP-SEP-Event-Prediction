@@ -181,12 +181,12 @@ class SEPSeqModel(nn.Module):
         return out
 
 
-def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
+def preload_matched_images_into_memory(df, wavelength=171, cache_file=None, max_file=None):
 
     if cache_file is None:
-        cache_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_171.pkl"
+        cache_file = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_{wavelength}.pkl"
     if max_file is None:
-        max_file = "/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_171.pkl"
+        max_file = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/matched_images_max_{wavelength}.pkl"
 
     # load cached results if available
     if os.path.exists(cache_file) and os.path.exists(max_file):
@@ -194,29 +194,29 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
             images_all = pickle.load(f)
         with open(max_file, 'rb') as f:
             max_val = pickle.load(f)
-        print(f"[DEBUG] Loaded cached 171 images ({len(images_all)})")
+        print(f"[DEBUG] Loaded cached h5 images ({len(images_all)})")
         return images_all, max_val
 
     # open HDF5 file
-    with h5py.File("/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia171_images_3hr_cadence.h5", "r") as f171:
-        times_171 = pd.to_datetime(np.array(f171["T_OBS"], dtype=str), errors='coerce')
-        print(f"[DEBUG] 171 timestamps: {times_171.min()} → {times_171.max()}")
+    with h5py.File(f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/data_collection/aia{wavelength}_images_3hr_cadence.h5", "r") as f_h5:
+        times_h5 = pd.to_datetime(np.array(f_h5["T_OBS"], dtype=str), errors='coerce')
+        print(f"[DEBUG] {wavelength} timestamps: {times_h5.min()} → {times_h5.max()}")
 
         images_list = []
-        max_171 = 0.0
+        max_h5 = 0.0
 
-        print("preloading AIA 171 images...")
+        print(f"preloading AIA {wavelength} images...")
         for t in df["SDO_time"]:
-            # nearest 171 timestamp
-            idx171 = np.argmin(np.abs((times_171 - t).total_seconds()))
-            img171 = np.nan_to_num(f171["images"][idx171][...], nan=0.0)
-            img171 = np.clip(img171, 0, None)
-            max_171 = max(max_171, img171.max())
-            images_list.append(img171)
+            # nearest timestamp
+            idx_h5 = np.argmin(np.abs((times_h5 - t).total_seconds()))
+            img_h5 = np.nan_to_num(f_h5["images"][idx_h5][...], nan=0.0)
+            img_h5 = np.clip(img_h5, 0, None)
+            max_h5 = max(max_h5, img_h5.max())
+            images_list.append(img_h5)
 
         # log-normalize
         images_all = np.array([
-            np.log1p(img) / np.log1p(max_171) for img in images_list
+            np.log1p(img) / np.log1p(max_h5) for img in images_list
         ], dtype=np.float16)
 
         # add channel dim: (N, 1, H, W)
@@ -226,10 +226,10 @@ def preload_matched_images_into_memory(df, cache_file=None, max_file=None):
     with open(cache_file, 'wb') as f:
         pickle.dump(images_all, f)
     with open(max_file, 'wb') as f:
-        pickle.dump(max_171, f)
+        pickle.dump(max_h5, f)
 
-    print(f"[DEBUG] Loaded {len(images_all)} 171 images, max_val={max_171:.3f}")
-    return images_all, max_171
+    print(f"[DEBUG] Loaded {len(images_all)} {wavelength} images, max_val={max_h5:.3f}")
+    return images_all, max_h5
 
 # metrics
 def compute_metrics(y_true, y_pred):
@@ -296,17 +296,27 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=0.0001)
     parser.add_argument("--window_size", type=int, default=8)
+    parser.add_argument("--n_heads", type=int, default=4)
+    parser.add_argument("--n_attn_blocks", type=int, default=3)
+    parser.add_argument("--hidden_head", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1717)
+    parser.add_argument("--wavelength", type=int, default=171)
     args = parser.parse_args()
 
     epochs = args.epochs
     batch_size = args.batch_size
     learning_rate = args.learning_rate
     window_size = args.window_size
+    n_heads = args.n_heads
+    n_attn_blocks = args.n_attn_blocks
+    hidden_head = args.hidden_head
     random_seed = args.seed
+    wavelength = args.wavelength
 
     name = (
-        f"TCLASS10Pep{epochs}_bs{batch_size}_lr{learning_rate}_winsize{window_size}_seed{random_seed}"
+        f"TCLASS_{wavelength}_ep{epochs}_bs{batch_size}_lr{learning_rate}"
+        f"_winsize{window_size}_heads{n_heads}_blocks{n_attn_blocks}_hidden{hidden_head}"
+        f"_seed{random_seed}"
     )
     print("training:", name)
     os.environ["WANDB_MODE"] = "offline"
@@ -320,6 +330,9 @@ def main():
             "optimizer": "adam",
             "learning_rate": learning_rate,
             "loss": "BCEWithLogitsLoss",
+            "n_heads": n_heads,
+            "n_attn_blocks": n_attn_blocks,
+            "hidden_head": hidden_head,
         }
     )
 
@@ -337,8 +350,12 @@ def main():
         df["psp_ephem_features_HCI_R"].values.astype(np.float32)
     ], axis=1)
 
+    lon_raw    = df["psp_footpoint_stonyhurst_lon"].values.astype(np.float32)
+    r_raw      = df["psp_ephem_features_HCI_R"].values.astype(np.float32)
+    timestamps = df["SDO_time"].to_numpy()
+
     # images
-    images_all, max_val = preload_matched_images_into_memory(df)
+    images_all, max_val = preload_matched_images_into_memory(df, wavelength=wavelength)
 
     all_indices = np.arange(len(df))
     blocks = [all_indices[i:i+80] for i in range(0, len(all_indices), 80)]
@@ -355,7 +372,12 @@ def main():
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SEPSeqModel(window_size=window_size).to(device)
+    model = SEPSeqModel(
+        window_size=window_size,
+        n_heads=n_heads,
+        n_attn_blocks=n_attn_blocks,
+        hidden_head=hidden_head
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
@@ -368,7 +390,7 @@ def main():
 
     best_val_loss = float("inf")
     best_epoch = 0
-    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/sep_{name}.pt"
+    MODEL_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/models/{name}.pt"
     num_params = count_trainable_params(model)
     print(f"Number of trainable parameters: {num_params:,}")
 
@@ -510,6 +532,31 @@ def main():
     "val_hss": val_metrics["HSS"],
     "val_f1": val_metrics["F1"],
     })
+
+    PRED_OUT = f"/scratch/gpfs/th5879/PSP-SEP-Event-Prediction/model/preds/{name}.npz"
+    os.makedirs(os.path.dirname(PRED_OUT), exist_ok=True)
+
+    train_dates_mpl = mdates.date2num(timestamps[train_ds.valid_indices])
+    val_dates_mpl   = mdates.date2num(timestamps[val_ds.valid_indices])
+
+    np.savez(
+        PRED_OUT,
+        train_true      = y_train_true,
+        train_pred      = y_train_pred,
+        train_dates_mpl = train_dates_mpl,
+        train_lon       = lon_raw[train_ds.valid_indices],
+        train_r         = r_raw[train_ds.valid_indices],
+
+        val_true        = y_val_true,
+        val_pred        = y_val_pred,
+        val_dates_mpl   = val_dates_mpl,
+        val_lon         = lon_raw[val_ds.valid_indices],
+        val_r           = r_raw[val_ds.valid_indices],
+
+        seed = random_seed,
+    )
+
+    print(f"saved predictions to {PRED_OUT}")
 
 
 if __name__ == "__main__":
